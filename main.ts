@@ -1,4 +1,4 @@
-import { Plugin, MarkdownPostProcessorContext, TFile } from "obsidian";
+import { Plugin, MarkdownPostProcessorContext, TFile, Notice } from "obsidian";
 
 interface TimeEntry {
   start: string; // ISO timestamp
@@ -6,7 +6,7 @@ interface TimeEntry {
 }
 
 interface TimeTrackerData {
-  entries: TimeEntry[];
+  entries: any[];
   activeStart: string | null; // ISO timestamp if a session is currently active
 }
 
@@ -157,6 +157,11 @@ export default class TimeTrackerPlugin extends Plugin {
     const totalMinutes = selfMinutes + childrenMinutes;
     const formatted = this.formatTotalMinutes(totalMinutes);
     
+    // Only verify/log if we are actually doing a rollup (override present) or it's a direct action
+    if (childPathOverride) {
+        new Notice(`Time Tracker: Rolling up ${file.basename} -> ${formatted}`);
+    }
+
     await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
       frontmatter["time-logged"] = formatted;
     });
@@ -184,22 +189,36 @@ export default class TimeTrackerPlugin extends Plugin {
   ): number {
     let minutes = 0;
     
+    // Strategy 1: Use resolvedLinks (Fastest)
     const resolvedLinks = this.app.metadataCache.resolvedLinks;
-    if (!resolvedLinks) return 0;
+    const backlinkFiles: string[] = [];
 
-    for (const [sourcePath, links] of Object.entries(resolvedLinks)) {
-        // optim: check if sourcePath links to file.path
-        if (!links.hasOwnProperty(file.path)) {
-            continue;
+    if (resolvedLinks) {
+        for (const [sourcePath, links] of Object.entries(resolvedLinks)) {
+            if (links.hasOwnProperty(file.path)) {
+                backlinkFiles.push(sourcePath);
+            }
         }
+    }
 
+    // Strategy 2: Fallback to getBacklinksForFile if resolvedLinks missed it (e.g. cache lag)
+    // merged with dedup
+    const specificBacklinks = (this.app.metadataCache as any).getBacklinksForFile(file);
+    if (specificBacklinks?.data) {
+        for (const sourcePath of Object.keys(specificBacklinks.data)) {
+            if (!backlinkFiles.includes(sourcePath)) {
+                backlinkFiles.push(sourcePath);
+            }
+        }
+    }
+
+    for (const sourcePath of backlinkFiles) {
         // Check override
         if (childPathOverride && sourcePath === childPathOverride && childMinutesOverride !== undefined) {
              minutes += childMinutesOverride;
              continue;
         }
 
-        // Verify it's actually a parent link
         const sourceFile = this.app.vault.getAbstractFileByPath(sourcePath);
         if (!(sourceFile instanceof TFile)) continue;
 
@@ -209,12 +228,13 @@ export default class TimeTrackerPlugin extends Plugin {
         const parentProp = cache.frontmatter["parent"];
         if (!parentProp) continue;
 
-        // Resolve the parent link and check if it points to 'file'
+        // Strict Parent Check: Does this child *explicitly* name 'file' as parent?
         const parentLink = this.getParentLinkText(parentProp);
         if (!parentLink) continue;
 
-        const parentFile = this.app.metadataCache.getFirstLinkpathDest(parentLink, sourcePath);
-        if (parentFile && parentFile.path === file.path) {
+        // Resolve the link relative to the source file
+        const parentDest = this.app.metadataCache.getFirstLinkpathDest(parentLink, sourcePath);
+        if (parentDest && parentDest.path === file.path) {
              const timeLogged = cache.frontmatter["time-logged"];
              if (timeLogged) {
                  minutes += this.parseDurationToMinutes(timeLogged);
@@ -244,6 +264,7 @@ export default class TimeTrackerPlugin extends Plugin {
   }
 
   private getParentLinkText(parentProp: any): string | null {
+      // Handle array or string
       let parentStr = "";
       if (Array.isArray(parentProp)) {
         parentStr = String(parentProp[0]); 
@@ -251,8 +272,13 @@ export default class TimeTrackerPlugin extends Plugin {
         parentStr = String(parentProp);
       }
       
+      // Standard [[link]] format
       const match = parentStr.match(/\[\[(.*?)(?:\|.*)?\]\]/);
-      return match ? match[1] : null;
+      if (match) return match[1];
+
+      // Handle plain text parent "Task Name" (unlikely but possible)
+      // Only if it doesn't look like a link ??
+      return parentStr;
   }
 
   private async updateParentRecursively(file: TFile, totalMinutes: number): Promise<void> {
@@ -268,22 +294,25 @@ export default class TimeTrackerPlugin extends Plugin {
       const parentFile = this.app.metadataCache.getFirstLinkpathDest(parentLink, file.path);
       
       if (parentFile instanceof TFile) {
+          // Read parent content to preserve its self-time
           let trackerData: TimeTrackerData = { entries: [], activeStart: null };
           
-          const content = await this.app.vault.read(parentFile);
-           const blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
-           if (blockMatch) {
-               try {
-                   trackerData = JSON.parse(blockMatch[1]);
-                   if (Array.isArray(trackerData)) {
-                        trackerData = { entries: trackerData as any, activeStart: null };
-                   }
-               } catch (e) {
-                   // ignore parse error
-               }
-           }
+          try {
+            const content = await this.app.vault.read(parentFile);
+            const blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
+            if (blockMatch) {
+                const parsed = JSON.parse(blockMatch[1]);
+                if (Array.isArray(parsed)) {
+                    trackerData = { entries: parsed as any, activeStart: null };
+                } else {
+                    trackerData = parsed;
+                }
+            }
+          } catch(e) {
+              console.error("Failed to read parent tracker data", e);
+          }
            
-           await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
+          await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
       }
   }
 
