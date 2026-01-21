@@ -1,4 +1,4 @@
-import { Plugin, MarkdownPostProcessorContext, TFile, Notice } from "obsidian";
+import { Plugin, MarkdownPostProcessorContext, TFile } from "obsidian";
 
 interface TimeEntry {
   start: string; // ISO timestamp
@@ -157,10 +157,7 @@ export default class TimeTrackerPlugin extends Plugin {
     const totalMinutes = selfMinutes + childrenMinutes;
     const formatted = this.formatTotalMinutes(totalMinutes);
     
-    // Only verify/log if we are actually doing a rollup (override present) or it's a direct action
-    if (childPathOverride) {
-        new Notice(`Time Tracker: Rolling up ${file.basename} -> ${formatted}`);
-    }
+
 
     await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
       frontmatter["time-logged"] = formatted;
@@ -309,7 +306,7 @@ export default class TimeTrackerPlugin extends Plugin {
                 }
             }
           } catch(e) {
-              console.error("Failed to read parent tracker data", e);
+              // ignore error
           }
            
           await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
