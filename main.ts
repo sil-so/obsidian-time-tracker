@@ -152,16 +152,10 @@ export default class TimeTrackerPlugin extends Plugin {
     childPathOverride?: string,
     childMinutesOverride?: number
   ): Promise<void> {
-    console.log(`[TimeTracker] Syncing frontmatter for ${file.path}`);
     const selfMinutes = this.calculateTotalMinutes(data.entries);
-    console.log(`[TimeTracker] Self minutes for ${file.path}: ${selfMinutes}`);
-    
     const childrenMinutes = this.calculateChildrenMinutes(file, childPathOverride, childMinutesOverride);
-    console.log(`[TimeTracker] Children minutes for ${file.path}: ${childrenMinutes}`);
-
     const totalMinutes = selfMinutes + childrenMinutes;
     const formatted = this.formatTotalMinutes(totalMinutes);
-    console.log(`[TimeTracker] Total minutes for ${file.path}: ${totalMinutes} (${formatted})`);
     
     await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
       frontmatter["time-logged"] = formatted;
@@ -190,50 +184,40 @@ export default class TimeTrackerPlugin extends Plugin {
   ): number {
     let minutes = 0;
     
-    // Find files that link to this one via 'parent' property
-    // Cast to any because getBacklinksForFile might be missing in type definition
-    const backlinks = (this.app.metadataCache as any).getBacklinksForFile(file);
-    if (!backlinks || !backlinks.data) {
-        console.log(`[TimeTracker] No backlinks found for ${file.path}`);
-        return 0;
-    }
+    const resolvedLinks = this.app.metadataCache.resolvedLinks;
+    if (!resolvedLinks) return 0;
 
-    console.log(`[TimeTracker] Found ${Object.keys(backlinks.data).length} backlinks for ${file.path}`);
-
-    // The backlinks object has keys as file paths
-    for (const sourcePath of Object.keys(backlinks.data)) {
-        // If this is the child we just updated, use the override value
-        if (childPathOverride && sourcePath === childPathOverride && childMinutesOverride !== undefined) {
-             console.log(`[TimeTracker] Using override for ${sourcePath}: ${childMinutesOverride}`);
-            minutes += childMinutesOverride;
+    for (const [sourcePath, links] of Object.entries(resolvedLinks)) {
+        // optim: check if sourcePath links to file.path
+        if (!links.hasOwnProperty(file.path)) {
             continue;
         }
 
+        // Check override
+        if (childPathOverride && sourcePath === childPathOverride && childMinutesOverride !== undefined) {
+             minutes += childMinutesOverride;
+             continue;
+        }
+
+        // Verify it's actually a parent link
         const sourceFile = this.app.vault.getAbstractFileByPath(sourcePath);
         if (!(sourceFile instanceof TFile)) continue;
 
         const cache = this.app.metadataCache.getFileCache(sourceFile);
         if (!cache?.frontmatter) continue;
 
-        // check if parent property points to this file
         const parentProp = cache.frontmatter["parent"];
         if (!parentProp) continue;
 
-        // Normalize parentProp to string
-        let parentStr = "";
-        if (Array.isArray(parentProp)) {
-            parentStr = parentProp.join(", ");
-        } else {
-            parentStr = String(parentProp);
-        }
+        // Resolve the parent link and check if it points to 'file'
+        const parentLink = this.getParentLinkText(parentProp);
+        if (!parentLink) continue;
 
-        // Check if one of the links in parent prop matches our file
-        if (parentStr.includes(file.basename)) {
+        const parentFile = this.app.metadataCache.getFirstLinkpathDest(parentLink, sourcePath);
+        if (parentFile && parentFile.path === file.path) {
              const timeLogged = cache.frontmatter["time-logged"];
              if (timeLogged) {
-                 const parsed = this.parseDurationToMinutes(timeLogged);
-                 console.log(`[TimeTracker] adding ${parsed} mins from child ${sourcePath}`);
-                 minutes += parsed;
+                 minutes += this.parseDurationToMinutes(timeLogged);
              }
         }
     }
@@ -259,48 +243,34 @@ export default class TimeTrackerPlugin extends Plugin {
       return minutes;
   }
 
-  private async updateParentRecursively(file: TFile, totalMinutes: number): Promise<void> {
-      console.log(`[TimeTracker] Attempting to bubble up from ${file.path}`);
-      const cache = this.app.metadataCache.getFileCache(file);
-      if (!cache?.frontmatter) {
-          console.log(`[TimeTracker] No frontmatter for ${file.path}`);
-          return;
-      }
-
-      const parentProp = cache.frontmatter["parent"];
-      if (!parentProp) {
-           console.log(`[TimeTracker] No parent property for ${file.path}`);
-          return;
-      }
-
+  private getParentLinkText(parentProp: any): string | null {
       let parentStr = "";
       if (Array.isArray(parentProp)) {
-        parentStr = parentProp[0]; // Take first parent if array
+        parentStr = String(parentProp[0]); 
       } else {
         parentStr = String(parentProp);
       }
       
-      console.log(`[TimeTracker] Parent property string: ${parentStr}`);
-
-      // Extract basename from [[link]]
       const match = parentStr.match(/\[\[(.*?)(?:\|.*)?\]\]/);
-      if (!match) {
-           console.log(`[TimeTracker] Parent property regex match failed`);
-          return;
-      }
+      return match ? match[1] : null;
+  }
+
+  private async updateParentRecursively(file: TFile, totalMinutes: number): Promise<void> {
+      const cache = this.app.metadataCache.getFileCache(file);
+      if (!cache?.frontmatter) return;
+
+      const parentProp = cache.frontmatter["parent"];
+      if (!parentProp) return;
+
+      const parentLink = this.getParentLinkText(parentProp);
+      if (!parentLink) return;
       
-      const parentName = match[1];
-      console.log(`[TimeTracker] Resolved parent name: ${parentName}`);
-      // Find the file
-      const parentFile = this.app.metadataCache.getFirstLinkpathDest(parentName, file.path);
+      const parentFile = this.app.metadataCache.getFirstLinkpathDest(parentLink, file.path);
       
       if (parentFile instanceof TFile) {
-          console.log(`[TimeTracker] Found parent file: ${parentFile.path}, updating...`);
-          // Trigger a sync on the parent
           let trackerData: TimeTrackerData = { entries: [], activeStart: null };
           
           const content = await this.app.vault.read(parentFile);
-           // Simple regex to extract the block
            const blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
            if (blockMatch) {
                try {
@@ -309,14 +279,11 @@ export default class TimeTrackerPlugin extends Plugin {
                         trackerData = { entries: trackerData as any, activeStart: null };
                    }
                } catch (e) {
-                   // ignore parse error, treat as empty
+                   // ignore parse error
                }
            }
            
-           // Pass the current file's path and new total minutes as override
            await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
-      } else {
-          console.log(`[TimeTracker] Could not resolve parent file`);
       }
   }
 
