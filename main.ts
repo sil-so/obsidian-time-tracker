@@ -1,4 +1,4 @@
-import { Plugin, MarkdownPostProcessorContext, TFile } from "obsidian";
+import { Plugin, MarkdownPostProcessorContext, TFile, debounce, TAbstractFile } from "obsidian";
 
 interface TimeEntry {
   start: string; // ISO timestamp
@@ -15,6 +15,67 @@ export default class TimeTrackerPlugin extends Plugin {
     this.registerMarkdownCodeBlockProcessor("time-tracker", (source, el, ctx) =>
       this.processTimeTrackerBlock(source, el, ctx)
     );
+
+    // Watch for manual edits to the time-tracker block
+    this.registerEvent(
+      this.app.vault.on("modify", debounce((file) => this.onFileModify(file), 2000, true))
+    );
+  }
+
+  private async onFileModify(file: TAbstractFile) {
+    if (!(file instanceof TFile) || file.extension !== "md") return;
+
+    // 1. Peek: Read content and checks if valid time-tracker block exists
+    const content = await this.app.vault.read(file);
+    const blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
+    if (!blockMatch) return;
+
+    // 2. Peek: Parse data
+    let trackerData: TimeTrackerData = { entries: [], activeStart: null };
+    try {
+        const parsed = JSON.parse(blockMatch[1]);
+        if (Array.isArray(parsed)) {
+            trackerData = { entries: parsed as any, activeStart: null };
+        } else {
+            trackerData = parsed;
+        }
+    } catch {
+        return; // Invalid JSON, ignore
+    }
+
+    // 3. Expected vs Current?
+    const selfMinutes = this.calculateTotalMinutes(trackerData.entries);
+    
+    // We can't easily calculate children minutes here without potentially being slow, 
+    // BUT we can check if the SELF minutes match what's expected for this file.
+    // However, syncTimeToFrontmatter handles the full calculation (self + children).
+    
+    // Let's check the current *frontmatter* time.
+    const cache = this.app.metadataCache.getFileCache(file);
+    const currentString = cache?.frontmatter?.["timelogged"];
+    
+    // If we can't parse current, or don't have it, we might want to run sync.
+    // BUT, blindly running sync might cause loops.
+    // The safest "check" is: specific to self-time logic? 
+    // Actually, syncTimeToFrontmatter does the full sum.
+    
+    // Let's rely on the "debounce" to save us from insanity, but add one check:
+    // If the content of the block implies a certain self-time, and the frontmatter *already* reflects that + children...
+    // usage: strictly check if running this *would* change anything.
+    
+    // To do that, we'd need to run the full calc. 
+    // Let's just run it, but inside syncTimeToFrontmatter, verify before writing!
+    // I will modify syncTimeToFrontmatter to have a 'checkOnly' mode or something?
+    // No, better: calculate everything here, compare final string, only Write if different.
+    
+    const childrenMinutes = this.calculateChildrenMinutes(file);
+    const totalMinutes = selfMinutes + childrenMinutes;
+    const formatted = this.formatTotalMinutes(totalMinutes);
+    
+    if (currentString !== formatted) {
+        // console.log(`Manual edit detected. Updating ${file.basename} from ${currentString} to ${formatted}`);
+        await this.syncTimeToFrontmatter(file, trackerData);
+    }
   }
 
   private processTimeTrackerBlock(
@@ -160,7 +221,7 @@ export default class TimeTrackerPlugin extends Plugin {
 
 
     await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
-      frontmatter["time-logged"] = formatted;
+      frontmatter["timelogged"] = formatted;
     });
 
     // Bubble up to parent
@@ -232,7 +293,7 @@ export default class TimeTrackerPlugin extends Plugin {
         // Resolve the link relative to the source file
         const parentDest = this.app.metadataCache.getFirstLinkpathDest(parentLink, sourcePath);
         if (parentDest && parentDest.path === file.path) {
-             const timeLogged = cache.frontmatter["time-logged"];
+             const timeLogged = cache.frontmatter["timelogged"];
              if (timeLogged) {
                  minutes += this.parseDurationToMinutes(timeLogged);
              }
@@ -294,9 +355,11 @@ export default class TimeTrackerPlugin extends Plugin {
           // Read parent content to preserve its self-time
           let trackerData: TimeTrackerData = { entries: [], activeStart: null };
           
+          let blockMatch: RegExpMatchArray | null = null;
+          
           try {
             const content = await this.app.vault.read(parentFile);
-            const blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
+            blockMatch = content.match(/```time-tracker\n([\s\S]*?)\n```/);
             if (blockMatch) {
                 const parsed = JSON.parse(blockMatch[1]);
                 if (Array.isArray(parsed)) {
@@ -308,8 +371,15 @@ export default class TimeTrackerPlugin extends Plugin {
           } catch(e) {
               // ignore error
           }
-           
-          await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
+          
+          // Check if parent should be updated (has block OR has timelogged already)
+          const parentCache = this.app.metadataCache.getFileCache(parentFile);
+          const hasTimeTracker = blockMatch !== null;
+          const hasTimeLogged = parentCache?.frontmatter && "timelogged" in parentCache.frontmatter;
+
+          if (hasTimeTracker || hasTimeLogged) {
+              await this.syncTimeToFrontmatter(parentFile, trackerData, file.path, totalMinutes);
+          }
       }
   }
 
