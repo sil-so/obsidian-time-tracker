@@ -1,0 +1,9 @@
+{
+  "id": "time-tracker",
+  "name": "Time Tracker",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Track work sessions per project directly in your notes.",
+  "author": "Silso",
+  "isDesktopOnly": false
+}
