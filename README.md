@@ -91,9 +91,7 @@ The plugin writes a `timelogged` property to each note:
 
 ## Images
 
-<img width="1514" height="951" alt="SCR-20260128-nvnq" src="https://github.com/user-attachments/assets/720b0909-a883-4726-86c7-d5a338b7a6ed" />
-
-<img width="1514" height="951" alt="SCR-20260128-nvqq" src="https://github.com/user-attachments/assets/1f6d3be3-835c-4996-89f3-bdd8674c7c5d" />
+<img width="800" height="503" alt="SCR-20260225-dfor" src="https://github.com/user-attachments/assets/d4f2fffe-4fa6-43dd-a036-8a769bb8b8ca" />
 
 ## License
 
